@@ -24,6 +24,7 @@ from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    image_placeholder_text,
     recent_message_start_index,
     strip_think,
     truncate_text,
@@ -772,6 +773,22 @@ _ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
 _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 
+def _missing_media_breadcrumbs(messages: list[dict], summary: str) -> str:
+    """Render fact lines for archived media paths absent from *summary*.
+    Uses the ``[skip]`` mark from ``agent/consolidator_archive.md``.
+    """
+    lines = []
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        for path in message.get("media") or []:
+            if isinstance(path, str) and path and path not in summary:
+                lines.append(
+                    f"- [skip] Uploaded media available at {image_placeholder_text(path)}"
+                )
+    return "\n".join(dict.fromkeys(lines))
+
+
 class Consolidator:
     """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
 
@@ -1005,13 +1022,15 @@ class Consolidator:
             logger.warning("Consolidation provider returned an error, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key)
             return None
-        summary = response.content or "[no summary]"
+        summary = strip_think(response.content or "[no summary]").strip()
+        manifest = _missing_media_breadcrumbs(messages, summary)
+        entry = "\n".join(part for part in (manifest, summary) if part)
         self.store.append_history(
-            summary,
+            entry,
             max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
             session_key=session_key,
         )
-        return summary
+        return entry
 
     async def maybe_consolidate_by_tokens(
         self,

@@ -27,14 +27,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.memory import Consolidator, MemoryStore
+from nanobot.agent.memory import Consolidator, MemoryStore, _missing_media_breadcrumbs
 from nanobot.providers.base import GenerationSettings
 from nanobot.session.manager import Session
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.prompt_templates import render_template
 
 MEDIA_PATH = "/home/user/.nanobot/media/upload_photo.png"
 MEDIA_NAME = "upload_photo.png"
 TIMESTAMP = "2026-07-27T10:00"
+MANIFEST_LINE = f"- [skip] Uploaded media available at [image: {MEDIA_PATH}]"
 
 
 @dataclass(frozen=True)
@@ -184,3 +186,137 @@ async def test_archive_preserves_media_path_for_image_only_turn(
     )
     prompt = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
     assert MEDIA_PATH in prompt
+
+
+# --- Determinism: the path survives even when the summarizer omits it ---
+
+
+def _entry(store) -> str:
+    """The single history.jsonl entry written by an archive() call."""
+    entries = store.read_unprocessed_history(since_cursor=0)
+    assert len(entries) == 1
+    return entries[0]["content"]
+
+
+async def test_archive_restates_path_when_summary_omits_it(
+    consolidator, mock_provider, store, runtime
+):
+    """The summarizer paraphrased the turn away; the manifest puts the path back."""
+    mock_provider.chat_with_retry.return_value = MagicMock(
+        content="User uploaded a photo and asked about it.",
+        finish_reason="stop",
+    )
+    result = await consolidator.archive(
+        [{"role": "user", "content": "", "media": [MEDIA_PATH]}],
+        runtime=runtime,
+    )
+    assert _entry(store).startswith(MANIFEST_LINE)
+    assert MEDIA_PATH in result
+
+
+async def test_archive_does_not_duplicate_path_kept_by_summary(
+    consolidator, mock_provider, store, runtime
+):
+    """A summarizer that already wrote the path gets no redundant manifest line."""
+    mock_provider.chat_with_retry.return_value = MagicMock(
+        content=f"User uploaded {MEDIA_PATH} and asked about it.",
+        finish_reason="stop",
+    )
+    await consolidator.archive(
+        [{"role": "user", "content": "", "media": [MEDIA_PATH]}],
+        runtime=runtime,
+    )
+    assert _entry(store).count(MEDIA_PATH) == 1
+
+
+async def test_archive_manifest_survives_an_oversized_summary(
+    consolidator, mock_provider, store, runtime
+):
+    """The entry cap truncates from the end, so a leading manifest is untouchable."""
+    mock_provider.chat_with_retry.return_value = MagicMock(
+        content="x" * 20_000,
+        finish_reason="stop",
+    )
+    await consolidator.archive(
+        [{"role": "user", "content": "", "media": [MEDIA_PATH]}],
+        runtime=runtime,
+    )
+    assert _entry(store).startswith(MANIFEST_LINE)
+
+
+async def test_archive_manifest_covers_only_removed_messages(
+    consolidator, mock_provider, store, runtime
+):
+    """Retained turns keep their own breadcrumb via get_history; only removed
+    turns need restating."""
+    retained_path = "/home/user/.nanobot/media/still_live.png"
+    archived = {"role": "user", "content": "old", "media": [MEDIA_PATH]}
+    retained = {"role": "user", "content": "new", "media": [retained_path]}
+    await consolidator.archive(
+        [archived],
+        runtime=runtime,
+        summary_messages=[archived, retained],
+    )
+    entry = _entry(store)
+    assert MEDIA_PATH in entry
+    assert retained_path not in entry
+
+
+async def test_archive_scrubs_think_leak_without_losing_the_manifest(
+    consolidator, mock_provider, store, runtime
+):
+    """A leading unclosed <think> must not reach history.jsonl, and stripping it
+    must not take the manifest with it."""
+    mock_provider.chat_with_retry.return_value = MagicMock(
+        content="<think>internal reasoning about the user",
+        finish_reason="stop",
+    )
+    result = await consolidator.archive(
+        [{"role": "user", "content": "", "media": [MEDIA_PATH]}],
+        runtime=runtime,
+    )
+    entry = _entry(store)
+    assert entry == MANIFEST_LINE
+    assert "internal reasoning" not in entry
+    assert "internal reasoning" not in result
+
+
+# --- Manifest helper: which archived media paths the summary failed to keep ---
+
+
+def test_missing_breadcrumbs_reports_path_absent_from_summary():
+    messages = [{"role": "user", "content": "", "media": [MEDIA_PATH]}]
+    assert _missing_media_breadcrumbs(messages, "User sent a photo.") == MANIFEST_LINE
+
+
+def test_missing_breadcrumbs_use_a_mark_the_consolidator_template_defines():
+    """The manifest borrows the template's ``[skip]`` mark so Dream's per-mark
+    rules apply to it; renaming the mark upstream must fail loudly here."""
+    assert "[skip]" in render_template("agent/consolidator_archive.md", strip=True)
+
+
+def test_missing_breadcrumbs_skips_path_already_in_summary():
+    messages = [{"role": "user", "content": "", "media": [MEDIA_PATH]}]
+    assert _missing_media_breadcrumbs(messages, f"Saved to {MEDIA_PATH} for later.") == ""
+
+
+def test_missing_breadcrumbs_deduplicates_repeated_path():
+    messages = [
+        {"role": "user", "content": "one", "media": [MEDIA_PATH]},
+        {"role": "user", "content": "two", "media": [MEDIA_PATH]},
+    ]
+    assert _missing_media_breadcrumbs(messages, "Summary.") == MANIFEST_LINE
+
+
+def test_missing_breadcrumbs_ignores_non_user_roles():
+    messages = [{"role": "assistant", "content": "here", "media": [MEDIA_PATH]}]
+    assert _missing_media_breadcrumbs(messages, "Summary.") == ""
+
+
+def test_missing_breadcrumbs_tolerates_malformed_media():
+    messages = [
+        {"role": "user", "content": "a"},
+        {"role": "user", "content": "b", "media": None},
+        {"role": "user", "content": "c", "media": ["", None, 7]},
+    ]
+    assert _missing_media_breadcrumbs(messages, "Summary.") == ""
