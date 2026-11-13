@@ -31,6 +31,7 @@ from nanobot.utils.helpers import (
     build_assistant_message,
     content_with_media_breadcrumbs,
     ensure_dir,
+    estimate_message_tokens,
     estimate_prompt_tokens_chain,
     strip_think,
     truncate_text,
@@ -53,6 +54,7 @@ class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
 
     _DEFAULT_MAX_HISTORY = 1000
+    _DREAM_HISTORY_TOKEN_BUDGET = 8_000
     # Durable files whose real working-tree delta grounds Dream commit messages.
     # Deliberately excludes memory/.dream_cursor so progress bookkeeping never
     # appears as a durable-memory edit in the audit record.
@@ -503,10 +505,20 @@ class MemoryStore:
             return text
         return self.default_dream_prompt()
 
-    def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None:
+    def build_dream_prompt(
+        self,
+        *,
+        max_entries: int = 20,
+        max_history_tokens: int = _DREAM_HISTORY_TOKEN_BUDGET,
+    ) -> tuple[str, int] | None:
         """Build the Dream prompt with unprocessed history context.
 
         Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
+
+        Entries are included whole, oldest first, until *max_history_tokens*
+        is reached; the rest stay unprocessed for the next run. The oldest
+        entry is always included so the cursor can advance; its size is
+        already bounded when it is written to the journal.
 
         The current contents of the durable memory files (SOUL.md, USER.md,
         memory/MEMORY.md) reach Dream through the normal agent system context.
@@ -516,14 +528,19 @@ class MemoryStore:
         if not entries:
             return None
 
-        batch = entries[:max_entries]
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {truncate_text(e['content'], 1000)}"
-            for e in batch
-        )
+        lines: list[str] = []
+        used_tokens = 0
+        for entry in entries[:max_entries]:
+            line = f"[{entry['timestamp']}] {entry['content']}"
+            tokens = estimate_message_tokens({"content": line})
+            if lines and used_tokens + tokens > max_history_tokens:
+                break
+            lines.append(line)
+            used_tokens += tokens
+        history_text = "\n".join(lines)
         template = self._dream_template()
         prompt = f"{template}\n\n## Conversation History\n{history_text}"
-        return (prompt, batch[-1]["cursor"])
+        return (prompt, entries[len(lines) - 1]["cursor"])
 
     def dream_content_diff(self) -> str:
         """Structured summary of uncommitted changes to the durable memory files.

@@ -106,15 +106,47 @@ class TestBuildDreamPrompt:
         prompt, _ = result
         assert prompt.startswith(store.default_dream_prompt() + "\n\n## Conversation History\n")
 
-    def test_truncates_long_entries_at_1000_chars(self, store):
+    def test_keeps_long_entries_whole(self, store):
         long_content = "x" * 2000
         store.append_history(long_content)
         result = store.build_dream_prompt()
         assert result is not None
         prompt, _ = result
-        assert long_content not in prompt
-        assert "x" * 1000 in prompt
-        assert "x" * 1001 not in prompt
+        assert long_content in prompt
+
+    def test_defers_entries_past_history_token_budget(self, store, monkeypatch):
+        # Byte estimates: "[YYYY-MM-DD HH:MM] " (19) + 477 content + 4 overhead = 500 per entry.
+        monkeypatch.setattr("nanobot.utils.helpers._get_token_encoding", lambda: None)
+        for label in "abc":
+            store.append_history(label * 477)
+
+        result = store.build_dream_prompt(max_history_tokens=1000)
+        assert result is not None
+        prompt, cursor = result
+        assert cursor == 2
+        assert "a" * 477 in prompt
+        assert "b" * 477 in prompt
+        assert "c" * 477 not in prompt
+
+        store.set_last_dream_cursor(cursor)
+        next_result = store.build_dream_prompt(max_history_tokens=1000)
+        assert next_result is not None
+        next_prompt, next_cursor = next_result
+        assert next_cursor == 3
+        assert "c" * 477 in next_prompt
+
+    def test_includes_oldest_entry_even_when_it_exceeds_budget(self, store, monkeypatch):
+        # Byte estimates: 19 + 977 + 4 = 1000, ten times the budget.
+        monkeypatch.setattr("nanobot.utils.helpers._get_token_encoding", lambda: None)
+        store.append_history("a" * 977)
+        store.append_history("b" * 10)
+
+        result = store.build_dream_prompt(max_history_tokens=100)
+        assert result is not None
+        prompt, cursor = result
+        assert cursor == 1
+        assert "a" * 977 in prompt
+        assert "b" * 10 not in prompt
 
     def test_batches_oldest_unprocessed_entries_first(self, store):
         for i in range(25):
